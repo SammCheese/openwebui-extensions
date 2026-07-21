@@ -2,12 +2,13 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.3.0
+version: 0.5.0
 required_open_webui_version: 0.5.0
 """
 
 import asyncio
 import hashlib
+import json
 import re
 from collections import OrderedDict
 from typing import Optional
@@ -50,6 +51,17 @@ class Filter:
         max_tokens: int = Field(
             default=768, description="Max tokens for the enumeration"
         )
+        thinking: str = Field(
+            default="off",
+            json_schema_extra={"enum": ["auto", "off", "on"]},
+            description=(
+                "Sets chat_template_kwargs.enable_thinking for thinking-capable "
+                "models (Qwen3-VL etc.), so the whole max_tokens budget goes to "
+                "the actual enumeration. 'auto' = don't send the field at all. "
+                "Needs llama-server running with --jinja; harmless no-op for "
+                "models whose template ignores it."
+            ),
+        )
         temperature: float = Field(
             default=0.2, description="Low temp keeps enumeration factual"
         )
@@ -74,6 +86,9 @@ class Filter:
         # image digest -> description. Retrying/regenerating a turn resends the
         # same image; the digest matches and we skip the API call entirely.
         self._cache: "OrderedDict[str, str]" = OrderedDict()
+        # Last failure reason, surfaced in the UI status so users don't have
+        # to tail the server log to find out why the pass produced nothing.
+        self._last_error: Optional[str] = None
 
     # ---------- cache ----------
 
@@ -128,6 +143,10 @@ class Filter:
             "max_tokens": self.valves.max_tokens,
             "temperature": self.valves.temperature,
         }
+        if self.valves.thinking != "auto":
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": self.valves.thinking == "on"
+            }
         if self.valves.id_slot >= 0:
             payload["id_slot"] = self.valves.id_slot
 
@@ -140,21 +159,84 @@ class Filter:
                     "Content-Type": "application/json",
                 },
             ) as r:
-                r.raise_for_status()
-                data = await r.json()
-            desc = data["choices"][0]["message"]["content"].strip()
-            # Strip any leading chain-of-thought the model might emit
-            desc = _THINK_RE.sub("", desc).strip()
-            if desc:
-                self._cache_put(key, desc)
-            return desc or None
-        except Exception as e:
-            print(f"[vision-prepass] failed: {e}")
+                raw = await r.text()
+                if r.status != 200:
+                    self._fail(f"HTTP {r.status}: {raw[:300]}")
+                    return None
+            data = json.loads(raw)
+        except asyncio.TimeoutError:
+            self._fail(
+                f"timed out after {self.valves.timeout}s — raise the timeout "
+                f"valve if generation legitimately takes longer"
+            )
             return None
+        except Exception as e:
+            self._fail(f"{type(e).__name__}: {e}")
+            return None
+
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        content = msg.get("content")
+        # Some servers return content as a list of parts instead of a string
+        if isinstance(content, list):
+            content = "\n".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        desc = (content or "").strip()
+        # Strip chain-of-thought. A leading <think> with no closing tag means
+        # the model spent its entire budget thinking; there is no answer.
+        desc = _THINK_RE.sub("", desc).strip()
+        if desc.startswith("<think>"):
+            desc = ""
+
+        if not desc:
+            finish = choice.get("finish_reason")
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            hint = ""
+            if reasoning or finish == "length":
+                hint = (
+                    " — model used its whole max_tokens budget on thinking; "
+                    "set the thinking valve to 'off' (needs --jinja) or raise "
+                    "max_tokens"
+                )
+            self._fail(f"empty answer (finish_reason={finish}){hint}")
+            return None
+
+        self._cache_put(key, desc)
+        return desc
+
+    def _fail(self, reason: str) -> None:
+        self._last_error = reason
+        print(f"[vision-prepass] failed: {reason}")
 
     # ---------- filter entrypoint ----------
 
-    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    @staticmethod
+    async def _status(emitter, description: str, done: bool = False) -> None:
+        if not emitter:
+            return
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": description,
+                        "done": done,
+                        "action": "vision_prepass",
+                    },
+                }
+            )
+        except Exception:
+            pass
+
+    async def inlet(
+        self,
+        body: dict,
+        __event_emitter__=None,
+        __user__: Optional[dict] = None,
+    ) -> dict:
         messages = body.get("messages", [])
         if not messages:
             return body
@@ -179,9 +261,22 @@ class Filter:
             ):
                 return body
 
+        self._last_error = None
+
+        # On a retry/regeneration every digest hits the cache, so don't show an
+        # "analyzing" status for work that won't happen.
+        misses = sum(
+            1 for img in images if self._cache_get(self._digest(img)) is None
+        )
+
         timeout = aiohttp.ClientTimeout(total=self.valves.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             if self.valves.concurrent and len(images) > 1:
+                if misses:
+                    await self._status(
+                        __event_emitter__,
+                        f"Running context-free vision pass on {misses} image(s)…",
+                    )
                 raw = await asyncio.gather(
                     *(self._describe(session, img) for img in images),
                     return_exceptions=True,
@@ -191,7 +286,14 @@ class Filter:
                         print(f"[vision-prepass] image {i} raised: {r!r}")
                 raw = [r if isinstance(r, str) else None for r in raw]
             else:
-                raw = [await self._describe(session, img) for img in images]
+                raw = []
+                for i, img in enumerate(images, 1):
+                    if self._cache_get(self._digest(img)) is None:
+                        await self._status(
+                            __event_emitter__,
+                            f"Context-free vision pass: image {i}/{len(images)}…",
+                        )
+                    raw.append(await self._describe(session, img))
 
         descriptions = [
             f"{_INJECT_MARKER} {i}, produced with no "
@@ -201,7 +303,21 @@ class Filter:
             if desc
         ]
         if not descriptions:
-            return body  # vision pass failed; pass through untouched
+            reason = f": {self._last_error}" if self._last_error else ""
+            await self._status(
+                __event_emitter__,
+                f"Vision pre-pass failed{reason} — images passed through untouched",
+                done=True,
+            )
+            return body
+
+        cached_note = "" if misses else " (cached)"
+        await self._status(
+            __event_emitter__,
+            f"Visual inventory injected for {len(descriptions)}/{len(images)} "
+            f"image(s){cached_note}",
+            done=True,
+        )
 
         injected = "\n\n".join(descriptions)
         new_content = []

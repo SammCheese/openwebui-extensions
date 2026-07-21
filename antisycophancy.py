@@ -2,7 +2,7 @@
 title: Anti-Sycophancy Anchor
 author: Sammy
 description: Counters positivity/confirmation bias in small instruct models (Gemma etc.) whose system prompt attention decays with context. Re-injects a condensed rule block at the END of context every turn, optionally logit-biases sycophantic opener tokens, and scrubs agreement-openers from responses.
-version: 0.2.0
+version: 0.2.1
 required_open_webui_version: 0.5.0
 """
 
@@ -82,7 +82,7 @@ class Filter:
 
     # ---------- inlet: recency reinjection ----------
 
-    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    async def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         messages = body.get("messages", [])
         if not messages or messages[-1].get("role") != "user":
             return body
@@ -141,7 +141,7 @@ class Filter:
 
     # ---------- outlet: opener scrubbing ----------
 
-    def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
         if not self.valves.scrub_openers:
             return body
         messages = body.get("messages", [])

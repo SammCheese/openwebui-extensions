@@ -2,7 +2,7 @@
 title: Image → Open Terminal Mirror
 author: Sammy
 description: Saves every image attached to a chat message into the Open Terminal filesystem (via base64 text write + decode), and injects the file path into the message so the model can operate on it with shell tools. Async, with content-hash dedupe so retries/edits don't re-upload.
-version: 0.3.0
+version: 0.4.0
 required_open_webui_version: 0.5.0
 """
 
@@ -152,10 +152,13 @@ class Filter:
         if cached:
             return cached
 
-        # 2) Remote dedupe (survives filter reload / server restart)
+        # 2) Remote dedupe (survives filter reload / server restart).
+        # The sentinel is split ("EXI""STS") so the command string itself never
+        # contains "EXISTS" — /execute responses that echo the command back
+        # would otherwise always match and we'd never upload anything.
         if self.valves.check_remote:
             result = await self._exec(
-                session, f"test -f '{img_path}' && echo EXISTS", wait=5.0
+                session, f"test -f '{img_path}' && echo \"EXI\"\"STS\"", wait=5.0
             )
             if result and "EXISTS" in str(result):
                 self._cache_put(digest, img_path)
@@ -181,9 +184,28 @@ class Filter:
 
     # ---------- filter entrypoint ----------
 
+    @staticmethod
+    async def _status(emitter, description: str, done: bool = False) -> None:
+        if not emitter:
+            return
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": description,
+                        "done": done,
+                        "action": "img_mirror",
+                    },
+                }
+            )
+        except Exception:
+            pass
+
     async def inlet(
         self,
         body: dict,
+        __event_emitter__=None,
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ) -> dict:
@@ -223,6 +245,26 @@ class Filter:
             )[:32]
             dest = f"{dest}/{chat_id}"
 
+        # On a retry/regeneration every image hits the in-memory cache; skip
+        # the "mirroring…" status for work that won't happen.
+        def _mem_hit(p: dict) -> bool:
+            m = self._DATA_URL.match(
+                ((p.get("image_url") or {}).get("url", "")).strip()
+            )
+            if not m:
+                return False
+            digest = hashlib.sha256(
+                m.group("b64").encode("ascii", "ignore")
+            ).hexdigest()[:16]
+            return self._cache_get(digest) is not None
+
+        misses = sum(1 for p in images if not _mem_hit(p))
+        if misses:
+            await self._status(
+                __event_emitter__,
+                f"Mirroring {misses} image(s) to terminal filesystem…",
+            )
+
         timeout = aiohttp.ClientTimeout(total=self.valves.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             results = await asyncio.gather(
@@ -241,6 +283,14 @@ class Filter:
                 saved.append(r)
             elif isinstance(r, BaseException):
                 print(f"[img-mirror] image {i} raised: {r!r}")
+
+        failed = len(images) - len(saved)
+        summary = f"Mirrored {len(saved)}/{len(images)} image(s) to terminal"
+        if failed:
+            summary += f" ({failed} failed, see server log)"
+        elif not misses:
+            summary += " (cached)"
+        await self._status(__event_emitter__, summary, done=True)
 
         if saved and self.valves.inject_note:
             note = (
