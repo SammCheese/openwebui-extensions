@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.5.0
+version: 0.5.1
 required_open_webui_version: 0.5.0
 """
 
@@ -29,6 +29,10 @@ class Filter:
         llama_url: str = Field(
             default="http://127.0.0.1:5001/v1/chat/completions",
             description="llama-server chat completions endpoint",
+        )
+        llama_model: str = Field(
+            default="",
+            description="model to use in router mode",
         )
         api_key: str = Field(
             default="X",
@@ -150,6 +154,9 @@ class Filter:
         if self.valves.id_slot >= 0:
             payload["id_slot"] = self.valves.id_slot
 
+        if self.valves.llama_model != "":
+            payload["model"] = self.valves.llama_model
+
         try:
             async with session.post(
                 self.valves.llama_url,
@@ -265,9 +272,7 @@ class Filter:
 
         # On a retry/regeneration every digest hits the cache, so don't show an
         # "analyzing" status for work that won't happen.
-        misses = sum(
-            1 for img in images if self._cache_get(self._digest(img)) is None
-        )
+        misses = sum(1 for img in images if self._cache_get(self._digest(img)) is None)
 
         timeout = aiohttp.ClientTimeout(total=self.valves.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:

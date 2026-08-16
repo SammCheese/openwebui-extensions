@@ -48,7 +48,7 @@ class Filter:
         )
         as_system_message: bool = Field(
             default=False,
-            description="Inject as a system message before the latest user turn instead of appending to it. Note: Gemma's template may fold or reject mid-conversation system roles, appending to the user message (default) is safer.",
+            description="Inject as a system message before the latest user turn instead of appending to it.",
         )
         scrub_openers: bool = Field(
             default=True,
