@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.5.1
+version: 0.6.0
 required_open_webui_version: 0.5.0
 """
 
@@ -32,10 +32,10 @@ class Filter:
         )
         llama_model: str = Field(
             default="",
-            description="model to use in router mode",
+            description="model to use in router mode, leave empty for the currently loaded model",
         )
         api_key: str = Field(
-            default="X",
+            default="",
             description="API key for llama-server (--api-key value)",
         )
         id_slot: int = Field(
@@ -65,6 +65,10 @@ class Filter:
                 "Needs llama-server running with --jinja; harmless no-op for "
                 "models whose template ignores it."
             ),
+        )
+        regenerate: bool = Field(
+            default=False,
+            description="If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
         )
         temperature: float = Field(
             default=0.2, description="Low temp keeps enumeration factual"
@@ -126,12 +130,12 @@ class Filter:
         ]
 
     async def _describe(
-        self, session: aiohttp.ClientSession, image_part: dict
+        self, session: aiohttp.ClientSession, image_part: dict, model: Optional[str] = None
     ) -> Optional[str]:
         """One isolated API call: image + neutral prompt, zero history."""
         key = self._digest(image_part)
         cached = self._cache_get(key)
-        if cached is not None:
+        if cached is not None and not self.valves.regenerate:
             return cached
 
         payload = {
@@ -154,8 +158,10 @@ class Filter:
         if self.valves.id_slot >= 0:
             payload["id_slot"] = self.valves.id_slot
 
-        if self.valves.llama_model != "":
+        if self.valves.llama_model:
             payload["model"] = self.valves.llama_model
+        elif model:
+            payload["model"] = model
 
         try:
             async with session.post(
@@ -211,7 +217,8 @@ class Filter:
             self._fail(f"empty answer (finish_reason={finish}){hint}")
             return None
 
-        self._cache_put(key, desc)
+        if not self.valves.regenerate:
+            self._cache_put(key, desc)
         return desc
 
     def _fail(self, reason: str) -> None:
@@ -243,6 +250,7 @@ class Filter:
         body: dict,
         __event_emitter__=None,
         __user__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
     ) -> dict:
         messages = body.get("messages", [])
         if not messages:
@@ -267,12 +275,17 @@ class Filter:
                 and _INJECT_MARKER in (part.get("text") or "")
             ):
                 return body
+            
+        if __model__ and "info" in __model__:
+            model = __model__["info"].get("base_model_id") or None
+        else:
+            model = None
 
         self._last_error = None
 
         # On a retry/regeneration every digest hits the cache, so don't show an
         # "analyzing" status for work that won't happen.
-        misses = sum(1 for img in images if self._cache_get(self._digest(img)) is None)
+        misses = sum(1 for img in images if self._cache_get(self._digest(img)) is None and not self.valves.regenerate)
 
         timeout = aiohttp.ClientTimeout(total=self.valves.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -283,7 +296,7 @@ class Filter:
                         f"Running context-free vision pass on {misses} image(s)…",
                     )
                 raw = await asyncio.gather(
-                    *(self._describe(session, img) for img in images),
+                    *(self._describe(session, img, model=model) for img in images),
                     return_exceptions=True,
                 )
                 for i, r in enumerate(raw, 1):
@@ -293,12 +306,12 @@ class Filter:
             else:
                 raw = []
                 for i, img in enumerate(images, 1):
-                    if self._cache_get(self._digest(img)) is None:
+                    if self._cache_get(self._digest(img)) is None and not self.valves.regenerate:
                         await self._status(
                             __event_emitter__,
                             f"Context-free vision pass: image {i}/{len(images)}…",
                         )
-                    raw.append(await self._describe(session, img))
+                    raw.append(await self._describe(session, img, model=model))
 
         descriptions = [
             f"{_INJECT_MARKER} {i}, produced with no "
