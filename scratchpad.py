@@ -2,7 +2,7 @@
 title: Per-Chat Scratchpad
 author: Sammy
 description: Gives the model a private, per-chat scratchpad. The model can rewrite it directly by emitting <system_scratchpad>...</system_scratchpad> anywhere in its response — including inside its reasoning, so deductions survive after thinking is stripped from history. Optionally, a distiller side call updates the pad on turns where the model didn't write it. Notes are reinjected near the end of context on the next turn.
-version: 0.3.0
+version: 0.3.1
 required_open_webui_version: 0.5.0
 """
 
@@ -232,7 +232,7 @@ class Filter:
         body: dict,
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
-        __model__: Optional[str] = None,
+        __model__: Optional[dict] = None,
     ) -> dict:
         messages = body.get("messages", [])
         if not messages or messages[-1].get("role") != "assistant":
@@ -285,7 +285,7 @@ class Filter:
             f"Assistant: {asst_text[:4000]}"
         )
 
-        if __model__ and "info" in __model__:
+        if __model__ and isinstance(__model__, dict) and "info" in __model__:
             model = __model__["info"].get("base_model_id") or None
         else:
             model = None

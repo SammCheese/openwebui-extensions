@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.6.0
+version: 0.6.1
 required_open_webui_version: 0.5.0
 """
 
@@ -66,7 +66,7 @@ class Filter:
                 "models whose template ignores it."
             ),
         )
-        regenerate: bool = Field(
+        REGENERATE: bool = Field(
             default=False,
             description="If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
         )
@@ -89,6 +89,16 @@ class Filter:
             description="How many digest→description entries to keep, so a retried or edited message doesn't re-run the vision pass on the same image",
         )
 
+    class UserValves(BaseModel):
+        REGENERATE: Optional[bool] = Field(
+            default=None,
+            description="Override the admin default: If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
+        )
+        ENABLED: Optional[bool] = Field(
+            default=None,
+            description="Override the admin default: If false, the vision pass is skipped entirely.",
+        )
+
     def __init__(self):
         self.valves = self.Valves()
         # image digest -> description. Retrying/regenerating a turn resends the
@@ -97,6 +107,9 @@ class Filter:
         # Last failure reason, surfaced in the UI status so users don't have
         # to tail the server log to find out why the pass produced nothing.
         self._last_error: Optional[str] = None
+        self.toggle = True  # user-controllable chip; clicking it opens the UserValves modal below
+
+
 
     # ---------- cache ----------
 
@@ -135,7 +148,7 @@ class Filter:
         """One isolated API call: image + neutral prompt, zero history."""
         key = self._digest(image_part)
         cached = self._cache_get(key)
-        if cached is not None and not self.valves.regenerate:
+        if cached is not None and not self.valves.REGENERATE:
             return cached
 
         payload = {
@@ -217,7 +230,7 @@ class Filter:
             self._fail(f"empty answer (finish_reason={finish}){hint}")
             return None
 
-        if not self.valves.regenerate:
+        if not self.valves.REGENERATE:
             self._cache_put(key, desc)
         return desc
 
@@ -252,6 +265,9 @@ class Filter:
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
+        if not self.valves.ENABLED or not isinstance(body, dict):
+            return body
+        
         messages = body.get("messages", [])
         if not messages:
             return body
@@ -285,7 +301,7 @@ class Filter:
 
         # On a retry/regeneration every digest hits the cache, so don't show an
         # "analyzing" status for work that won't happen.
-        misses = sum(1 for img in images if self._cache_get(self._digest(img)) is None and not self.valves.regenerate)
+        misses = sum(1 for img in images if self._cache_get(self._digest(img)) is None and not self.valves.REGENERATE)
 
         timeout = aiohttp.ClientTimeout(total=self.valves.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -306,7 +322,7 @@ class Filter:
             else:
                 raw = []
                 for i, img in enumerate(images, 1):
-                    if self._cache_get(self._digest(img)) is None and not self.valves.regenerate:
+                    if self._cache_get(self._digest(img)) is None and not self.valves.REGENERATE:
                         await self._status(
                             __event_emitter__,
                             f"Context-free vision pass: image {i}/{len(images)}…",
