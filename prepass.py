@@ -1,7 +1,7 @@
 """
 title: Side-Call Pre-Pass Injector
 author: Sammy
-version: 0.1.0
+version: 0.1.1
 description: > Runs a lightweight "side-call" to a router model before the main model
   responds. The router's output is injected into the main model's context
   (either as a dedicated system message or invisibly appended to the user's
@@ -103,11 +103,19 @@ class Filter:
         priority: int = Field(
             default=0, description="Filter execution order. Lower values run first."
         )
+        ENABLED: bool = Field(
+            default=True,
+            description="If false, the prepass is skipped entirely.",
+        )
 
     class UserValves(BaseModel):
-        INJECT_AS_SYSTEM_MESSAGE: Optional[bool] = Field(
-            default=None,
+        INJECT_AS_SYSTEM_MESSAGE: bool = Field(
+            default=True,
             description="Override the admin default: inject as a system message (on) or append invisibly to your message (off). Leave unset to use the admin default.",
+        )
+        ENABLED: bool = Field(
+            default=True,
+            description="Override the admin default: If false, the prepass is skipped entirely.",
         )
 
     def __init__(self):
@@ -161,6 +169,8 @@ class Filter:
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
+        if not self.valves.ENABLED or not isinstance(body, dict):
+            return body
         messages = body.get("messages")
         if not messages:
             return body

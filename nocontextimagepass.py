@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.6.1
+version: 0.6.2
 required_open_webui_version: 0.5.0
 """
 
@@ -70,6 +70,10 @@ class Filter:
             default=False,
             description="If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
         )
+        ENABLED: bool = Field(
+            default=True,
+            description="If false, the vision pass is skipped entirely.",
+        )
         temperature: float = Field(
             default=0.2, description="Low temp keeps enumeration factual"
         )
@@ -90,12 +94,12 @@ class Filter:
         )
 
     class UserValves(BaseModel):
-        REGENERATE: Optional[bool] = Field(
-            default=None,
+        REGENERATE: bool = Field(
+            default=False,
             description="Override the admin default: If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
         )
-        ENABLED: Optional[bool] = Field(
-            default=None,
+        ENABLED: bool = Field(
+            default=True,
             description="Override the admin default: If false, the vision pass is skipped entirely.",
         )
 
