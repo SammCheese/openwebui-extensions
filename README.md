@@ -4,7 +4,7 @@ Filter functions for [Open WebUI](https://github.com/open-webui/open-webui), bui
 
 > ## ⚠️ Disclaimer
 >
-> **These filters were AI-generated (with Claude) for personal use.**
+> **These filters were largely AI-generated (with Claude) for personal use and edited by me.**
 >
 > They are tuned to one specific homelab: a llama-server instance, small local
 > instruct models (Gemma-class), and a self-hosted "Open Terminal" shell API.

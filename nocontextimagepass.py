@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.6.2
+version: 0.7.0
 required_open_webui_version: 0.5.0
 """
 
@@ -25,6 +25,14 @@ class Filter:
         priority: int = Field(
             default=10,
             description="Filter execution order (lower runs first). Keep this between the terminal mirror (0) and the anti-sycophancy anchor (20).",
+        )
+        ENABLED: bool = Field(
+            default=True,
+            description="If false, the vision pass is skipped entirely.",
+        )
+        REGENERATE: bool = Field(
+            default=False,
+            description="If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
         )
         llama_url: str = Field(
             default="http://127.0.0.1:5001/v1/chat/completions",
@@ -66,14 +74,6 @@ class Filter:
                 "models whose template ignores it."
             ),
         )
-        REGENERATE: bool = Field(
-            default=False,
-            description="If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
-        )
-        ENABLED: bool = Field(
-            default=True,
-            description="If false, the vision pass is skipped entirely.",
-        )
         temperature: float = Field(
             default=0.2, description="Low temp keeps enumeration factual"
         )
@@ -105,15 +105,16 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
+        self.user_valves = self.UserValves()
         # image digest -> description. Retrying/regenerating a turn resends the
         # same image; the digest matches and we skip the API call entirely.
         self._cache: "OrderedDict[str, str]" = OrderedDict()
         # Last failure reason, surfaced in the UI status so users don't have
         # to tail the server log to find out why the pass produced nothing.
         self._last_error: Optional[str] = None
-        self.toggle = True  # user-controllable chip; clicking it opens the UserValves modal below
-
-
+        self.toggle = (
+            True  # user-controllable chip; clicking it opens the UserValves modal below
+        )
 
     # ---------- cache ----------
 
@@ -147,12 +148,17 @@ class Filter:
         ]
 
     async def _describe(
-        self, session: aiohttp.ClientSession, image_part: dict, model: Optional[str] = None
+        self,
+        session: aiohttp.ClientSession,
+        image_part: dict,
+        model: Optional[str] = None,
+        regenerate: bool = False,
     ) -> Optional[str]:
         """One isolated API call: image + neutral prompt, zero history."""
         key = self._digest(image_part)
         cached = self._cache_get(key)
-        if cached is not None and not self.valves.REGENERATE:
+
+        if cached is not None and not regenerate:
             return cached
 
         payload = {
@@ -234,7 +240,7 @@ class Filter:
             self._fail(f"empty answer (finish_reason={finish}){hint}")
             return None
 
-        if not self.valves.REGENERATE:
+        if not regenerate:
             self._cache_put(key, desc)
         return desc
 
@@ -269,9 +275,13 @@ class Filter:
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
-        if not self.valves.ENABLED or not isinstance(body, dict):
+
+        regenerate = self.user_valves.REGENERATE if __user__ else self.valves.REGENERATE
+        enabled = self.user_valves.ENABLED if __user__ else self.valves.ENABLED
+
+        if not enabled:
             return body
-        
+
         messages = body.get("messages", [])
         if not messages:
             return body
@@ -295,7 +305,7 @@ class Filter:
                 and _INJECT_MARKER in (part.get("text") or "")
             ):
                 return body
-            
+
         if __model__ and "info" in __model__:
             model = __model__["info"].get("base_model_id") or None
         else:
@@ -305,7 +315,11 @@ class Filter:
 
         # On a retry/regeneration every digest hits the cache, so don't show an
         # "analyzing" status for work that won't happen.
-        misses = sum(1 for img in images if self._cache_get(self._digest(img)) is None and not self.valves.REGENERATE)
+        misses = sum(
+            1
+            for img in images
+            if self._cache_get(self._digest(img)) is None and not regenerate
+        )
 
         timeout = aiohttp.ClientTimeout(total=self.valves.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -326,12 +340,16 @@ class Filter:
             else:
                 raw = []
                 for i, img in enumerate(images, 1):
-                    if self._cache_get(self._digest(img)) is None and not self.valves.REGENERATE:
+                    if self._cache_get(self._digest(img)) is None and not regenerate:
                         await self._status(
                             __event_emitter__,
                             f"Context-free vision pass: image {i}/{len(images)}…",
                         )
-                    raw.append(await self._describe(session, img, model=model))
+                    raw.append(
+                        await self._describe(
+                            session, img, model=model, regenerate=regenerate
+                        )
+                    )
 
         descriptions = [
             f"{_INJECT_MARKER} {i}, produced with no "
