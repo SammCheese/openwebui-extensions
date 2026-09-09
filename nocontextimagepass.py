@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.7.0
+version: 0.7.1
 required_open_webui_version: 0.5.0
 """
 
@@ -100,12 +100,11 @@ class Filter:
         )
         ENABLED: bool = Field(
             default=True,
-            description="Override the admin default: If false, the vision pass is skipped entirely.",
+            description="If false, the vision pass is skipped entirely.",
         )
 
     def __init__(self):
         self.valves = self.Valves()
-        self.user_valves = self.UserValves()
         # image digest -> description. Retrying/regenerating a turn resends the
         # same image; the digest matches and we skip the API call entirely.
         self._cache: "OrderedDict[str, str]" = OrderedDict()
@@ -152,7 +151,7 @@ class Filter:
         session: aiohttp.ClientSession,
         image_part: dict,
         model: Optional[str] = None,
-        regenerate: bool = False,
+        regenerate: Optional[bool] = False,
     ) -> Optional[str]:
         """One isolated API call: image + neutral prompt, zero history."""
         key = self._digest(image_part)
@@ -181,7 +180,7 @@ class Filter:
         if self.valves.id_slot >= 0:
             payload["id_slot"] = self.valves.id_slot
 
-        if self.valves.llama_model:
+        if self.valves.llama_model.strip():
             payload["model"] = self.valves.llama_model
         elif model:
             payload["model"] = model
@@ -242,6 +241,7 @@ class Filter:
 
         if not regenerate:
             self._cache_put(key, desc)
+
         return desc
 
     def _fail(self, reason: str) -> None:
@@ -275,9 +275,22 @@ class Filter:
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
+        uv = None
+        if __user__ and "valves" in __user__:
+            try:
+                uv = __user__["valves"]
+            except Exception:
+                pass
 
-        regenerate = self.user_valves.REGENERATE if __user__ else self.valves.REGENERATE
-        enabled = self.user_valves.ENABLED if __user__ else self.valves.ENABLED
+        
+        regenerate = self.valves.REGENERATE
+        enabled = self.valves.ENABLED
+        if uv:
+            try:
+                regenerate = uv.REGENERATE
+                enabled = uv.ENABLED
+            except Exception:
+                pass
 
         if not enabled:
             return body
@@ -330,7 +343,7 @@ class Filter:
                         f"Running context-free vision pass on {misses} image(s)…",
                     )
                 raw = await asyncio.gather(
-                    *(self._describe(session, img, model=model) for img in images),
+                    *(self._describe(session, img, model=model, regenerate=regenerate) for img in images),
                     return_exceptions=True,
                 )
                 for i, r in enumerate(raw, 1):
@@ -340,7 +353,7 @@ class Filter:
             else:
                 raw = []
                 for i, img in enumerate(images, 1):
-                    if self._cache_get(self._digest(img)) is None and not regenerate:
+                    if self._cache_get(self._digest(img)) is None or regenerate:
                         await self._status(
                             __event_emitter__,
                             f"Context-free vision pass: image {i}/{len(images)}…",

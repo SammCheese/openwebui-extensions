@@ -362,7 +362,7 @@ class Filter:
         if self.valves.id_slot >= 0:
             payload["id_slot"] = self.valves.id_slot
 
-        if self.valves.llama_model:
+        if self.valves.llama_model.strip():
             payload["model"] = self.valves.llama_model
         elif not self.valves.llama_model and model:
             payload["model"] = model
