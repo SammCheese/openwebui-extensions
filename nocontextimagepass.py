@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.7.1
+version: 0.7.2
 required_open_webui_version: 0.5.0
 """
 
@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 _INJECT_MARKER = "[Independent visual inventory of image"
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
+SVG = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NDAgNTEyIj48IS0tIUZvbnQgQXdlc29tZSBGcmVlIDcuMy4xIGJ5IEBmb250YXdlc29tZSAtIGh0dHBzOi8vZm9udGF3ZXNvbWUuY29tIExpY2Vuc2UgLSBodHRwczovL2ZvbnRhd2Vzb21lLmNvbS9saWNlbnNlL2ZyZWUgQ29weXJpZ2h0IDIwMjYgRm9udGljb25zLCBJbmMuLS0+PHBhdGggZD0iTTE5MiA2NGMwLTM1LjMgMjguNy02NCA2NC02NEw1NzYgMGMzNS4zIDAgNjQgMjguNyA2NCA2NGwwIDIyNGMwIDM1LjMtMjguNyA2NC02NCA2NGwtMzIwIDBjLTM1LjMgMC02NC0yOC43LTY0LTY0bDAtMjI0ek0zMjAgOTZhMzIgMzIgMCAxIDAgLTY0IDAgMzIgMzIgMCAxIDAgNjQgMHptMTU2LjUgMTEuNUM0NzIuMSAxMDAuNCA0NjQuNCA5NiA0NTYgOTZzLTE2LjEgNC40LTIwLjUgMTEuNWwtNTQgODguMy0xNy45LTI1LjZjLTQuNS02LjQtMTEuOC0xMC4yLTE5LjctMTAuMnMtMTUuMiAzLjgtMTkuNyAxMC4ybC01NiA4MGMtNS4xIDcuMy01LjggMTYuOS0xLjYgMjQuOFMyNzkuMSAyODggMjg4IDI4OGwyNTYgMGM4LjcgMCAxNi43LTQuNyAyMC45LTEyLjNzNC4xLTE2LjgtLjUtMjQuM2wtODgtMTQ0ek0xNDQgMTI4bDAgMTYwYzAgNjEuOSA1MC4xIDExMiAxMTIgMTEybDE5MiAwIDAgMTZjMCAzNS4zLTI4LjcgNjQtNjQgNjRMNjQgNDgwYy0zNS4zIDAtNjQtMjguNy02NC02NEwwIDE5MmMwLTM1LjMgMjguNy02NCA2NC02NGw4MCAwek01MiAxOTZsMCAyNGMwIDguOCA3LjIgMTYgMTYgMTZsMjQgMGM4LjggMCAxNi03LjIgMTYtMTZsMC0yNGMwLTguOC03LjItMTYtMTYtMTZsLTI0IDBjLTguOCAwLTE2IDcuMi0xNiAxNnptMTYgODBjLTguOCAwLTE2IDcuMi0xNiAxNmwwIDI0YzAgOC44IDcuMiAxNiAxNiAxNmwyNCAwYzguOCAwIDE2LTcuMiAxNi0xNmwwLTI0YzAtOC44LTcuMi0xNi0xNi0xNmwtMjQgMHptMCA5NmMtOC44IDAtMTYgNy4yLTE2IDE2bDAgMjRjMCA4LjggNy4yIDE2IDE2IDE2bDI0IDBjOC44IDAgMTYtNy4yIDE2LTE2bDAtMjRjMC04LjgtNy4yLTE2LTE2LTE2bC0yNCAweiIvPjwvc3ZnPg=="
 
 class Filter:
     class Valves(BaseModel):
@@ -35,8 +36,8 @@ class Filter:
             description="If true, the vision pass is re-run on every retry/regeneration. If false, the pass is only run once per image digest and cached for subsequent retries.",
         )
         llama_url: str = Field(
-            default="http://127.0.0.1:5001/v1/chat/completions",
-            description="llama-server chat completions endpoint",
+            default="http://127.0.0.1:5001/v1",
+            description="llama-server chat completions endpoint (e.g. http://127.0.0.1:5001/v1)",
         )
         llama_model: str = Field(
             default="",
@@ -102,9 +103,14 @@ class Filter:
             default=True,
             description="If false, the vision pass is skipped entirely.",
         )
+        FOCUS_PROMPT: str = Field(
+            default="",
+            description="If non-empty, this string is appended to the enumeration prompt for this user. Use it to bias the enumeration toward certain details (e.g. 'Focus on anatomical details and text in the image').",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
+        self.user_valves = self.UserValves()
         # image digest -> description. Retrying/regenerating a turn resends the
         # same image; the digest matches and we skip the API call entirely.
         self._cache: "OrderedDict[str, str]" = OrderedDict()
@@ -114,6 +120,7 @@ class Filter:
         self.toggle = (
             True  # user-controllable chip; clicking it opens the UserValves modal below
         )
+        self.icon = SVG
 
     # ---------- cache ----------
 
@@ -160,13 +167,18 @@ class Filter:
         if cached is not None and not regenerate:
             return cached
 
+        if self.user_valves.FOCUS_PROMPT.strip():
+            prompt = f"{self.valves.enumeration_prompt}\n\n{self.user_valves.FOCUS_PROMPT.strip()}"
+        else:
+            prompt = self.valves.enumeration_prompt
+
         payload = {
             "messages": [
                 {
                     "role": "user",
                     "content": [
                         image_part,
-                        {"type": "text", "text": self.valves.enumeration_prompt},
+                        {"type": "text", "text": prompt},
                     ],
                 }
             ],
@@ -287,8 +299,9 @@ class Filter:
         enabled = self.valves.ENABLED
         if uv:
             try:
-                regenerate = uv.REGENERATE
-                enabled = uv.ENABLED
+                self.user_valves.REGENERATE = uv.REGENERATE
+                self.user_valves.ENABLED = uv.ENABLED
+                self.user_valves.FOCUS_PROMPT = uv.FOCUS_PROMPT.strip()
             except Exception:
                 pass
 

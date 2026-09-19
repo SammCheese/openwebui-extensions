@@ -1,7 +1,7 @@
 """
 title: Side-Call Pre-Pass Injector
 author: Sammy
-version: 0.1.1
+version: 0.2.0
 description: > Runs a lightweight "side-call" to a router model before the main model
   responds. The router's output is injected into the main model's context
   (either as a dedicated system message or invisibly appended to the user's
@@ -34,13 +34,23 @@ def _extract_text(content) -> str:
         return "\n".join(parts)
     return ""
 
+def _extract_file_context(files: List[dict]) -> List[dict]:
+    """Pull file context out of an OpenAI-style content-block list."""
+    if isinstance(files, list):
+        return [f for f in files if isinstance(f, dict)]
+    return []
 
 def _strip_markers(text: str) -> str:
     return _MARK_RE.sub("", text or "").strip()
 
 
+SVG = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzODQgNTEyIj48IS0tIUZvbnQgQXdlc29tZSBGcmVlIDcuMy4xIGJ5IEBmb250YXdlc29tZSAtIGh0dHBzOi8vZm9udGF3ZXNvbWUuY29tIExpY2Vuc2UgLSBodHRwczovL2ZvbnRhd2Vzb21lLmNvbS9saWNlbnNlL2ZyZWUgQ29weXJpZ2h0IDIwMjYgRm9udGljb25zLCBJbmMuLS0+PHBhdGggZD0iTTM4NCAxOTJsLTY0IDAgMCAxMjgtMTI4IDAgMCAxMjgtMTkyIDAgMC0yNS42IDE2Ni40IDAgMC0xMjggMTI4IDAgMC0xMjggODkuNiAwIDAgMjUuNnptLTI1LjYgMzguNGwwIDEyOC0xMjggMCAwIDEyOC0xNjYuNCAwIDAgMjUuNiAxOTIgMCAwLTEyOCAxMjggMCAwLTE1My42LTI1LjYgMHptMjUuNiAxOTJsLTg5LjYgMCAwIDg5LjYgMjUuNiAwIDAtNjQgNjQgMCAwLTI1LjZ6TTAgMGwwIDM4NCAxMjggMCAwLTEyOCAxMjggMCAwLTEyOCAxMjggMCAwLTEyOC0zODQgMHoiLz48L3N2Zz4="
+
 class Filter:
     class Valves(BaseModel):
+        priority: int = Field(
+            default=0, description="Filter execution order. Lower values run first."
+        )
         ROUTER_BASE_URL: str = Field(
             default="http://localhost:8080/v1",
             description="Base URL of the llama.cpp OpenAI-compatible endpoint for the side-call/router model, e.g. http://localhost:8081/v1 (no trailing slash needed).",
@@ -76,6 +86,10 @@ class Filter:
                 "models whose template ignores it."
             ),
         )
+        USE_FILE_CONTEXT: bool = Field(
+            default=True,
+            description="If true, the side-call will receive the user's file context (if any). If false, the side-call will only see the user's text message.",
+        )
         SIDE_CALL_HISTORY_TURNS: int = Field(
             default=0,
             ge=0,
@@ -100,9 +114,6 @@ class Filter:
             default=True,
             description="Show status messages in the chat UI while the side-call runs.",
         )
-        priority: int = Field(
-            default=0, description="Filter execution order. Lower values run first."
-        )
         ENABLED: bool = Field(
             default=True,
             description="If false, the prepass is skipped entirely.",
@@ -117,12 +128,26 @@ class Filter:
             default=True,
             description="Override the admin default: If false, the prepass is skipped entirely.",
         )
+        USE_FILE_CONTEXT: bool = Field(
+            default=True,
+            description="Override the admin default: If false, the side-call will only see your text message, not any file context.",
+        )
+        SIDE_CALL_SYSTEM_PROMPT: str = Field(
+            default="",
+            description="Override the admin default system prompt for the side-call. Leave blank to use the admin default.",
+        )
+        SIDE_CALL_HISTORY_TURNS: int = Field(
+            default=0,
+            description="Override the admin default number of prior user/assistant turn-pairs to send to the side-call as context. Leave unset to use the admin default.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
+        self.user_valves = self.UserValves()
         self.toggle = (
             True  # user-controllable chip; clicking it opens the UserValves modal above
         )
+        self.icon = SVG
 
     # ---------------------------------------------------------------- router call
 
@@ -171,6 +196,24 @@ class Filter:
     ) -> dict:
         if not self.valves.ENABLED or not isinstance(body, dict):
             return body
+
+        uv = None
+        if __user__ and "valves" in __user__:
+            try:
+                uv = __user__["valves"]
+            except Exception:
+                pass
+        
+        if uv:
+            try:
+                self.user_valves.ENABLED = uv.ENABLED
+                self.user_valves.INJECT_AS_SYSTEM_MESSAGE = uv.INJECT_AS_SYSTEM_MESSAGE
+                self.user_valves.USE_FILE_CONTEXT = uv.USE_FILE_CONTEXT
+                self.user_valves.SIDE_CALL_SYSTEM_PROMPT = uv.SIDE_CALL_SYSTEM_PROMPT
+                self.user_valves.SIDE_CALL_HISTORY_TURNS = uv.SIDE_CALL_HISTORY_TURNS
+            except Exception:
+                pass
+        
         messages = body.get("messages")
         if not messages:
             return body
@@ -179,8 +222,9 @@ class Filter:
         if last_msg.get("role") != "user":
             return body
 
+        file_context = _extract_file_context(last_msg.get("files", []))
         user_text = _strip_markers(_extract_text(last_msg.get("content")))
-        if not user_text:
+        if not user_text and not file_context:
             return body
 
         if self.valves.EMIT_STATUS and __event_emitter__:
@@ -194,12 +238,21 @@ class Filter:
                 }
             )
 
+        if self.user_valves.SIDE_CALL_SYSTEM_PROMPT.strip():
+            system_prompt = self.user_valves.SIDE_CALL_SYSTEM_PROMPT.strip()
+        else:
+            system_prompt = self.valves.SIDE_CALL_SYSTEM_PROMPT.strip()
+
         side_messages = [
-            {"role": "system", "content": self.valves.SIDE_CALL_SYSTEM_PROMPT}
+            {"role": "system", "content": system_prompt}
         ]
 
-        if self.valves.SIDE_CALL_HISTORY_TURNS > 0:
-            pair_count = self.valves.SIDE_CALL_HISTORY_TURNS * 2
+        history_turns = self.valves.SIDE_CALL_HISTORY_TURNS
+        if self.user_valves.SIDE_CALL_HISTORY_TURNS > 0:
+            history_turns = self.user_valves.SIDE_CALL_HISTORY_TURNS
+
+        if history_turns > 0:
+            pair_count = history_turns * 2
             trimmed = []
             for m in messages[:-1]:
                 role = m.get("role")
@@ -210,11 +263,16 @@ class Filter:
                     trimmed.append({"role": role, "content": text})
             side_messages.extend(trimmed[-pair_count:])
 
-        side_messages.append({"role": "user", "content": user_text})
+        if self.valves.USE_FILE_CONTEXT and file_context:
+            side_messages.append({"role": "user", "content": user_text, "files": file_context})
+        else:
+            side_messages.append({"role": "user", "content": user_text})
 
         try:
             if __model__ and isinstance(__model__, dict):
                 model_name = __model__["info"].get("base_model_id")
+                if not model_name:
+                    model_name = body["model"]
 
             result = await self._call_router(side_messages, model_name)
         except Exception as e:
@@ -245,13 +303,10 @@ class Filter:
         if not result:
             return body
 
-        inject_as_system = self.valves.INJECT_AS_SYSTEM_MESSAGE
-        user_valves = (__user__ or {}).get("valves")
-        if (
-            isinstance(user_valves, self.UserValves)
-            and user_valves.INJECT_AS_SYSTEM_MESSAGE is not None
-        ):
-            inject_as_system = user_valves.INJECT_AS_SYSTEM_MESSAGE
+        if self.user_valves.INJECT_AS_SYSTEM_MESSAGE is not None:
+            inject_as_system = self.user_valves.INJECT_AS_SYSTEM_MESSAGE
+        else:
+            inject_as_system = self.valves.INJECT_AS_SYSTEM_MESSAGE
 
         injected_block = (
             f"{MARK_START}\n{self.valves.MAIN_PROMPT_PREFIX}\n{result}\n{MARK_END}"
