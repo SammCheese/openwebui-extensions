@@ -1,7 +1,7 @@
 """
 title: Side-Call Pre-Pass Injector
 author: Sammy
-version: 0.2.0
+version: 0.2.1
 description: > Runs a lightweight "side-call" to a router model before the main model
   responds. The router's output is injected into the main model's context
   (either as a dedicated system message or invisibly appended to the user's
@@ -11,9 +11,9 @@ required_open_webui_version: 0.5.0
 """
 
 import re
+from typing import List, Optional
 import aiohttp
 from pydantic import BaseModel, Field
-from typing import Optional, List
 
 # Zero-width-space + HTML-comment markers: invisible in rendered markdown/HTML,
 # but a reliable, greppable span for outlet() to find and strip.
@@ -34,17 +34,20 @@ def _extract_text(content) -> str:
         return "\n".join(parts)
     return ""
 
+
 def _extract_file_context(files: List[dict]) -> List[dict]:
     """Pull file context out of an OpenAI-style content-block list."""
     if isinstance(files, list):
         return [f for f in files if isinstance(f, dict)]
     return []
 
+
 def _strip_markers(text: str) -> str:
     return _MARK_RE.sub("", text or "").strip()
 
 
 SVG = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzODQgNTEyIj48IS0tIUZvbnQgQXdlc29tZSBGcmVlIDcuMy4xIGJ5IEBmb250YXdlc29tZSAtIGh0dHBzOi8vZm9udGF3ZXNvbWUuY29tIExpY2Vuc2UgLSBodHRwczovL2ZvbnRhd2Vzb21lLmNvbS9saWNlbnNlL2ZyZWUgQ29weXJpZ2h0IDIwMjYgRm9udGljb25zLCBJbmMuLS0+PHBhdGggZD0iTTM4NCAxOTJsLTY0IDAgMCAxMjgtMTI4IDAgMCAxMjgtMTkyIDAgMC0yNS42IDE2Ni40IDAgMC0xMjggMTI4IDAgMC0xMjggODkuNiAwIDAgMjUuNnptLTI1LjYgMzguNGwwIDEyOC0xMjggMCAwIDEyOC0xNjYuNCAwIDAgMjUuNiAxOTIgMCAwLTEyOCAxMjggMCAwLTE1My42LTI1LjYgMHptMjUuNiAxOTJsLTg5LjYgMCAwIDg5LjYgMjUuNiAwIDAtNjQgNjQgMCAwLTI1LjZ6TTAgMGwwIDM4NCAxMjggMCAwLTEyOCAxMjggMCAwLTEyOCAxMjggMCAwLTEyOC0zODQgMHoiLz48L3N2Zz4="
+
 
 class Filter:
     class Valves(BaseModel):
@@ -122,7 +125,7 @@ class Filter:
     class UserValves(BaseModel):
         INJECT_AS_SYSTEM_MESSAGE: bool = Field(
             default=True,
-            description="Override the admin default: inject as a system message (on) or append invisibly to your message (off). Leave unset to use the admin default.",
+            description="Override the admin default: inject as a system message (on) or append invisibly to your message (off).",
         )
         ENABLED: bool = Field(
             default=True,
@@ -138,15 +141,12 @@ class Filter:
         )
         SIDE_CALL_HISTORY_TURNS: int = Field(
             default=0,
-            description="Override the admin default number of prior user/assistant turn-pairs to send to the side-call as context. Leave unset to use the admin default.",
+            description="Override the admin default number of prior user/assistant turn-pairs to send to the side-call as context. Set to 0 to use the admin default.",
         )
 
     def __init__(self):
         self.valves = self.Valves()
-        self.user_valves = self.UserValves()
-        self.toggle = (
-            True  # user-controllable chip; clicking it opens the UserValves modal above
-        )
+        self.toggle = True
         self.icon = SVG
 
     # ---------------------------------------------------------------- router call
@@ -167,9 +167,9 @@ class Filter:
         }
 
         if self.valves.ENABLE_THINKING != "auto":
-          payload["chat_template_kwargs"] = {
-            "enable_thinking": self.valves.ENABLE_THINKING == "on"
-          }
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": self.valves.ENABLE_THINKING == "on"
+            }
 
         timeout = aiohttp.ClientTimeout(total=self.valves.REQUEST_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -194,26 +194,46 @@ class Filter:
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
-        if not self.valves.ENABLED or not isinstance(body, dict):
+        if not isinstance(body, dict):
             return body
 
-        uv = None
-        if __user__ and "valves" in __user__:
-            try:
-                uv = __user__["valves"]
-            except Exception:
-                pass
-        
-        if uv:
-            try:
-                self.user_valves.ENABLED = uv.ENABLED
-                self.user_valves.INJECT_AS_SYSTEM_MESSAGE = uv.INJECT_AS_SYSTEM_MESSAGE
-                self.user_valves.USE_FILE_CONTEXT = uv.USE_FILE_CONTEXT
-                self.user_valves.SIDE_CALL_SYSTEM_PROMPT = uv.SIDE_CALL_SYSTEM_PROMPT
-                self.user_valves.SIDE_CALL_HISTORY_TURNS = uv.SIDE_CALL_HISTORY_TURNS
-            except Exception:
-                pass
-        
+        # Extract UserValves into a plain dict per invocation
+        uv_dict = {}
+        if __user__ and isinstance(__user__, dict):
+            uv = __user__.get("valves")
+            if uv is not None:
+                if hasattr(uv, "model_dump"):
+                    uv_dict = uv.model_dump()
+                elif hasattr(uv, "dict"):
+                    uv_dict = uv.dict()
+                elif isinstance(uv, dict):
+                    uv_dict = uv
+
+        # Resolve effective valves (User override -> Admin default)
+        enabled = uv_dict.get("ENABLED", self.valves.ENABLED)
+        if not self.valves.ENABLED or not enabled:
+            return body
+
+        inject_as_system = uv_dict.get(
+            "INJECT_AS_SYSTEM_MESSAGE", self.valves.INJECT_AS_SYSTEM_MESSAGE
+        )
+        use_file_context = uv_dict.get(
+            "USE_FILE_CONTEXT", self.valves.USE_FILE_CONTEXT
+        )
+
+        user_prompt = uv_dict.get("SIDE_CALL_SYSTEM_PROMPT", "")
+        system_prompt = (
+            user_prompt.strip()
+            if user_prompt and user_prompt.strip()
+            else self.valves.SIDE_CALL_SYSTEM_PROMPT.strip()
+        )
+
+        user_turns = uv_dict.get("SIDE_CALL_HISTORY_TURNS")
+        if user_turns is not None and user_turns > 0:
+            history_turns = user_turns
+        else:
+            history_turns = self.valves.SIDE_CALL_HISTORY_TURNS
+
         messages = body.get("messages")
         if not messages:
             return body
@@ -238,18 +258,7 @@ class Filter:
                 }
             )
 
-        if self.user_valves.SIDE_CALL_SYSTEM_PROMPT.strip():
-            system_prompt = self.user_valves.SIDE_CALL_SYSTEM_PROMPT.strip()
-        else:
-            system_prompt = self.valves.SIDE_CALL_SYSTEM_PROMPT.strip()
-
-        side_messages = [
-            {"role": "system", "content": system_prompt}
-        ]
-
-        history_turns = self.valves.SIDE_CALL_HISTORY_TURNS
-        if self.user_valves.SIDE_CALL_HISTORY_TURNS > 0:
-            history_turns = self.user_valves.SIDE_CALL_HISTORY_TURNS
+        side_messages = [{"role": "system", "content": system_prompt}]
 
         if history_turns > 0:
             pair_count = history_turns * 2
@@ -263,17 +272,21 @@ class Filter:
                     trimmed.append({"role": role, "content": text})
             side_messages.extend(trimmed[-pair_count:])
 
-        if self.valves.USE_FILE_CONTEXT and file_context:
-            side_messages.append({"role": "user", "content": user_text, "files": file_context})
+        if use_file_context and file_context:
+            side_messages.append(
+                {"role": "user", "content": user_text, "files": file_context}
+            )
         else:
             side_messages.append({"role": "user", "content": user_text})
 
-        try:
-            if __model__ and isinstance(__model__, dict):
-                model_name = __model__["info"].get("base_model_id")
-                if not model_name:
-                    model_name = body["model"]
+        # Ensure model_name is safely initialized
+        model_name = body.get("model", "default")
+        if __model__ and isinstance(__model__, dict):
+            info = __model__.get("info", {})
+            if isinstance(info, dict) and info.get("base_model_id"):
+                model_name = info["base_model_id"]
 
+        try:
             result = await self._call_router(side_messages, model_name)
         except Exception as e:
             if self.valves.EMIT_STATUS and __event_emitter__:
@@ -303,17 +316,11 @@ class Filter:
         if not result:
             return body
 
-        if self.user_valves.INJECT_AS_SYSTEM_MESSAGE is not None:
-            inject_as_system = self.user_valves.INJECT_AS_SYSTEM_MESSAGE
-        else:
-            inject_as_system = self.valves.INJECT_AS_SYSTEM_MESSAGE
-
         injected_block = (
             f"{MARK_START}\n{self.valves.MAIN_PROMPT_PREFIX}\n{result}\n{MARK_END}"
         )
 
         if inject_as_system:
-            # Terminal context position: right before the user's turn, not the very top.
             messages.insert(
                 len(messages) - 1, {"role": "system", "content": injected_block}
             )
@@ -359,7 +366,6 @@ class Filter:
                         if stripped:
                             block["text"] = stripped
                             new_blocks.append(block)
-                        # else: drop this block, it was pure injection
                     else:
                         new_blocks.append(block)
                 m["content"] = new_blocks

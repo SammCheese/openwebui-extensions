@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.7.2
+version: 0.7.3
 required_open_webui_version: 0.5.0
 """
 
@@ -110,7 +110,6 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        self.user_valves = self.UserValves()
         # image digest -> description. Retrying/regenerating a turn resends the
         # same image; the digest matches and we skip the API call entirely.
         self._cache: "OrderedDict[str, str]" = OrderedDict()
@@ -159,6 +158,7 @@ class Filter:
         image_part: dict,
         model: Optional[str] = None,
         regenerate: Optional[bool] = False,
+        focus_prompt: Optional[str] = None,
     ) -> Optional[str]:
         """One isolated API call: image + neutral prompt, zero history."""
         key = self._digest(image_part)
@@ -167,8 +167,8 @@ class Filter:
         if cached is not None and not regenerate:
             return cached
 
-        if self.user_valves.FOCUS_PROMPT.strip():
-            prompt = f"{self.valves.enumeration_prompt}\n\n{self.user_valves.FOCUS_PROMPT.strip()}"
+        if focus_prompt is not None:
+            prompt = f"{self.valves.enumeration_prompt}\n\n{focus_prompt.strip()}"
         else:
             prompt = self.valves.enumeration_prompt
 
@@ -198,8 +198,9 @@ class Filter:
             payload["model"] = model
 
         try:
+            url = self.valves.llama_url.rstrip("/") + "/chat/completions"
             async with session.post(
-                self.valves.llama_url,
+                url,
                 json=payload,
                 headers={
                     "Authorization": f"Bearer {self.valves.api_key}",
@@ -287,23 +288,25 @@ class Filter:
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
-        uv = None
-        if __user__ and "valves" in __user__:
-            try:
-                uv = __user__["valves"]
-            except Exception:
-                pass
-
+        uv = __user__.get("valves") if isinstance(__user__, dict) else None
         
-        regenerate = self.valves.REGENERATE
-        enabled = self.valves.ENABLED
-        if uv:
-            try:
-                self.user_valves.REGENERATE = uv.REGENERATE
-                self.user_valves.ENABLED = uv.ENABLED
-                self.user_valves.FOCUS_PROMPT = uv.FOCUS_PROMPT.strip()
-            except Exception:
-                pass
+        if uv is not None:
+            if hasattr(uv, "model_dump"):
+                uv_dict = uv.model_dump()
+            elif hasattr(uv, "dict"):
+                uv_dict = uv.dict()
+            elif isinstance(uv, dict):
+                uv_dict = uv
+            else:
+                uv_dict = {}
+
+            regenerate = uv_dict.get("REGENERATE", self.valves.REGENERATE)
+            enabled = uv_dict.get("ENABLED", self.valves.ENABLED)
+            focus_prompt = uv_dict.get("FOCUS_PROMPT", "")
+        else:
+            regenerate = self.valves.REGENERATE
+            enabled = self.valves.ENABLED
+            focus_prompt = ""
 
         if not enabled:
             return body
@@ -356,7 +359,7 @@ class Filter:
                         f"Running context-free vision pass on {misses} image(s)…",
                     )
                 raw = await asyncio.gather(
-                    *(self._describe(session, img, model=model, regenerate=regenerate) for img in images),
+                    *(self._describe(session, img, model=model, regenerate=regenerate, focus_prompt=focus_prompt) for img in images),
                     return_exceptions=True,
                 )
                 for i, r in enumerate(raw, 1):
@@ -373,7 +376,7 @@ class Filter:
                         )
                     raw.append(
                         await self._describe(
-                            session, img, model=model, regenerate=regenerate
+                            session, img, model=model, regenerate=regenerate, focus_prompt=focus_prompt
                         )
                     )
 
