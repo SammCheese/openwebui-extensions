@@ -1,7 +1,7 @@
 """
 title: Side-Call Pre-Pass Injector
 author: Sammy
-version: 0.2.1
+version: 0.2.2
 description: > Runs a lightweight "side-call" to a router model before the main model
   responds. The router's output is injected into the main model's context
   (either as a dedicated system message or invisibly appended to the user's
@@ -34,13 +34,29 @@ def _extract_text(content) -> str:
         return "\n".join(parts)
     return ""
 
+def _extract_images(content, files: List[dict]) -> List[str]:
+    """Collect valid image data URLs from content blocks or file metadata."""
+    images = []
 
-def _extract_file_context(files: List[dict]) -> List[dict]:
-    """Pull file context out of an OpenAI-style content-block list."""
+    # Check content blocks for base64 or absolute URLs
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                img = block.get("image_url")
+                url = img.get("url") if isinstance(img, dict) else img
+                if isinstance(url, str) and (url.startswith("http") or url.startswith("data:image/")):
+                    images.append(url)
+
+    # Check file attachments for direct image URLs
     if isinstance(files, list):
-        return [f for f in files if isinstance(f, dict)]
-    return []
+        for f in files:
+            if isinstance(f, dict):
+                url = f.get("url")
+                content_type = f.get("content_type", "")
+                if url and (url.startswith("http") or url.startswith("data:image/") or "image" in content_type):
+                    images.append(url)
 
+    return images
 
 def _strip_markers(text: str) -> str:
     return _MARK_RE.sub("", text or "").strip()
@@ -58,12 +74,12 @@ class Filter:
             default="http://localhost:8080/v1",
             description="Base URL of the llama.cpp OpenAI-compatible endpoint for the side-call/router model, e.g. http://localhost:8081/v1 (no trailing slash needed).",
         )
-        ROUTER_API_KEY: str = Field(
-            default="",
+        ROUTER_API_KEY: Optional[str] = Field(
+            default=None,
             description="API key for the router endpoint, sent as 'Authorization: Bearer <key>'. Leave blank if llama-server has no key configured.",
         )
-        ROUTER_MODEL: str = Field(
-            default="",
+        ROUTER_MODEL: Optional[str] = Field(
+            default=None,
             description="Model name sent in the side-call's 'model' field. Optional — most single-model llama-server setups ignore this; leave blank to send a harmless placeholder.",
         )
         SIDE_CALL_SYSTEM_PROMPT: str = Field(
@@ -75,11 +91,11 @@ class Filter:
             description="Text prefixed to the side-call's output before it's injected into the main model's context.",
         )
         INJECT_AS_SYSTEM_MESSAGE: bool = Field(
-            default=True,
+            default=False,
             description="Default injection mode. True: inject as a standalone system message placed right before the user's turn. False: append invisibly to the end of the user's message. Users can override this per-chat via the filter chip's valve modal.",
         )
         ENABLE_THINKING: str = Field(
-            default="off",
+            default="auto",
             json_schema_extra={"enum": ["auto", "off", "on"]},
             description=(
                 "Sets chat_template_kwargs.enable_thinking for thinking-capable "
@@ -124,7 +140,7 @@ class Filter:
 
     class UserValves(BaseModel):
         INJECT_AS_SYSTEM_MESSAGE: bool = Field(
-            default=True,
+            default=False,
             description="Override the admin default: inject as a system message (on) or append invisibly to your message (off).",
         )
         ENABLED: bool = Field(
@@ -135,12 +151,12 @@ class Filter:
             default=True,
             description="Override the admin default: If false, the side-call will only see your text message, not any file context.",
         )
-        SIDE_CALL_SYSTEM_PROMPT: str = Field(
-            default="",
+        SIDE_CALL_SYSTEM_PROMPT: Optional[str] = Field(
+            default=None,
             description="Override the admin default system prompt for the side-call. Leave blank to use the admin default.",
         )
-        SIDE_CALL_HISTORY_TURNS: int = Field(
-            default=0,
+        SIDE_CALL_HISTORY_TURNS: Optional[int] = Field(
+            default=None,
             description="Override the admin default number of prior user/assistant turn-pairs to send to the side-call as context. Set to 0 to use the admin default.",
         )
 
@@ -149,9 +165,54 @@ class Filter:
         self.toggle = True
         self.icon = SVG
 
+    # ---------- user valves ----------
+
+    def user_valves(self, __user__: dict) -> dict:
+        uv = __user__.get("valves") if isinstance(__user__, dict) else None
+        
+        if uv is not None:
+            if hasattr(uv, "model_dump"):
+                uv_dict = uv.model_dump()
+            elif hasattr(uv, "dict"):
+                uv_dict = uv.dict()
+            elif isinstance(uv, dict):
+                uv_dict = uv
+            else:
+                uv_dict = {}
+
+            return uv_dict
+        
+        return {}
+
+    # --------- status ----------
+    @staticmethod
+    async def _status(emitter, description: str, done: bool = False) -> None:
+        if not emitter:
+            return
+        try:
+            await emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": description,
+                        "done": done,
+                        "action": "side-call pre-pass",
+                    },
+                }
+            )
+        except Exception:
+            pass
+
     # ---------------------------------------------------------------- router call
 
-    async def _call_router(self, side_messages: List[dict], model: str) -> str:
+    def _clean_model_id(self, model_id: Optional[str]) -> Optional[str]:
+        """Clean up the model ID to avoid sending empty strings or whitespace."""
+        if model_id is None:
+            return None
+        cleaned = model_id.strip().strip('"').strip("'")
+        return cleaned if cleaned else None
+
+    async def _call_router(self, side_messages: List[dict], model: Optional[str]) -> str:
         base = self.valves.ROUTER_BASE_URL.rstrip("/")
         url = f"{base}/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -159,7 +220,7 @@ class Filter:
             headers["Authorization"] = f"Bearer {self.valves.ROUTER_API_KEY}"
 
         payload = {
-            "model": self.valves.ROUTER_MODEL.strip() or model or "default",
+            "model": model or "gpt-4o-mini",
             "messages": side_messages,
             "max_tokens": self.valves.SIDE_CALL_MAX_TOKENS,
             "temperature": self.valves.SIDE_CALL_TEMPERATURE,
@@ -197,42 +258,29 @@ class Filter:
         if not isinstance(body, dict):
             return body
 
-        # Extract UserValves into a plain dict per invocation
-        uv_dict = {}
-        if __user__ and isinstance(__user__, dict):
-            uv = __user__.get("valves")
-            if uv is not None:
-                if hasattr(uv, "model_dump"):
-                    uv_dict = uv.model_dump()
-                elif hasattr(uv, "dict"):
-                    uv_dict = uv.dict()
-                elif isinstance(uv, dict):
-                    uv_dict = uv
+        user_valves = self.user_valves(__user__)
 
-        # Resolve effective valves (User override -> Admin default)
-        enabled = uv_dict.get("ENABLED", self.valves.ENABLED)
-        if not self.valves.ENABLED or not enabled:
+        # Safe resolution: fall back to admin valve if user valve is None
+        enabled = user_valves.get("ENABLED") if user_valves.get("ENABLED") is not None else self.valves.ENABLED
+        if not enabled:
             return body
 
-        inject_as_system = uv_dict.get(
-            "INJECT_AS_SYSTEM_MESSAGE", self.valves.INJECT_AS_SYSTEM_MESSAGE
+        inject_as_system = (
+            user_valves.get("INJECT_AS_SYSTEM_MESSAGE")
+            if user_valves.get("INJECT_AS_SYSTEM_MESSAGE") is not None
+            else self.valves.INJECT_AS_SYSTEM_MESSAGE
         )
-        use_file_context = uv_dict.get(
-            "USE_FILE_CONTEXT", self.valves.USE_FILE_CONTEXT
+        use_files = (
+            user_valves.get("USE_FILE_CONTEXT")
+            if user_valves.get("USE_FILE_CONTEXT") is not None
+            else self.valves.USE_FILE_CONTEXT
         )
+        user_prompt = (user_valves.get("SIDE_CALL_SYSTEM_PROMPT") or "").strip()
+        system_prompt = user_prompt if user_prompt else self.valves.SIDE_CALL_SYSTEM_PROMPT
 
-        user_prompt = uv_dict.get("SIDE_CALL_SYSTEM_PROMPT", "")
-        system_prompt = (
-            user_prompt.strip()
-            if user_prompt and user_prompt.strip()
-            else self.valves.SIDE_CALL_SYSTEM_PROMPT.strip()
-        )
-
-        user_turns = uv_dict.get("SIDE_CALL_HISTORY_TURNS")
-        if user_turns is not None and user_turns > 0:
-            history_turns = user_turns
-        else:
-            history_turns = self.valves.SIDE_CALL_HISTORY_TURNS
+        user_turns = user_valves.get("SIDE_CALL_HISTORY_TURNS")
+        if user_turns is None:
+            user_turns = self.valves.SIDE_CALL_HISTORY_TURNS
 
         messages = body.get("messages")
         if not messages:
@@ -241,27 +289,21 @@ class Filter:
         last_msg = messages[-1]
         if last_msg.get("role") != "user":
             return body
+        
+        raw_content = last_msg.get("content")
+        user_text = _strip_markers(_extract_text(raw_content))
+        images = _extract_images(raw_content, last_msg.get("files", [])) if use_files else []
 
-        file_context = _extract_file_context(last_msg.get("files", []))
-        user_text = _strip_markers(_extract_text(last_msg.get("content")))
-        if not user_text and not file_context:
+        if not user_text and not images:
             return body
 
         if self.valves.EMIT_STATUS and __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "Running side-call pre-pass...",
-                        "done": False,
-                    },
-                }
-            )
+            await self._status(__event_emitter__, "Running side-call pre-pass...")
 
         side_messages = [{"role": "system", "content": system_prompt}]
 
-        if history_turns > 0:
-            pair_count = history_turns * 2
+        if user_turns > 0:
+            pair_count = user_turns * 2
             trimmed = []
             for m in messages[:-1]:
                 role = m.get("role")
@@ -272,33 +314,25 @@ class Filter:
                     trimmed.append({"role": role, "content": text})
             side_messages.extend(trimmed[-pair_count:])
 
-        if use_file_context and file_context:
-            side_messages.append(
-                {"role": "user", "content": user_text, "files": file_context}
-            )
+        if images:
+            side_user_content = [{"type": "text", "text": user_text}]
+            for img_url in images[:3]:
+                side_user_content.append({"type": "image_url", "image_url": {"url": img_url}})
+            side_messages.append({"role": "user", "content": side_user_content})
         else:
             side_messages.append({"role": "user", "content": user_text})
 
-        # Ensure model_name is safely initialized
-        model_name = body.get("model", "default")
-        if __model__ and isinstance(__model__, dict):
-            info = __model__.get("info", {})
-            if isinstance(info, dict) and info.get("base_model_id"):
-                model_name = info["base_model_id"]
+        model_name = (
+            self._clean_model_id(self.valves.ROUTER_MODEL) 
+            or self._clean_model_id(body.get("model"))
+            or None
+        )
 
         try:
             result = await self._call_router(side_messages, model_name)
         except Exception as e:
             if self.valves.EMIT_STATUS and __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Pre-pass failed ({e}); continuing without it",
-                            "done": True,
-                        },
-                    }
-                )
+                await self._status(__event_emitter__, f"Pre-pass failed ({e}); continuing without it", done=True)
             if self.valves.ON_ERROR == "abort":
                 raise
             return body
@@ -306,12 +340,7 @@ class Filter:
         result = (result or "").strip()
 
         if self.valves.EMIT_STATUS and __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {"description": "Pre-pass complete", "done": True},
-                }
-            )
+            await self._status(__event_emitter__, "Pre-pass complete", done=True)
 
         if not result:
             return body
@@ -325,52 +354,12 @@ class Filter:
                 len(messages) - 1, {"role": "system", "content": injected_block}
             )
         else:
-            content = last_msg.get("content")
-            if isinstance(content, list):
-                content.append({"type": "text", "text": f"\n\n{injected_block}"})
+            if isinstance(raw_content, list):
+                raw_content.append({"type": "text", "text": f"\n\n{injected_block}"})
             else:
-                last_msg["content"] = f"{_extract_text(content)}\n\n{injected_block}"
+                last_msg["content"] = f"{user_text}\n\n{injected_block}"
 
         if __metadata__ is not None:
             __metadata__["_sidecall_injected"] = True
 
-        return body
-
-    # ---------------------------------------------------------------- outlet
-
-    async def outlet(self, body: dict, __metadata__: Optional[dict] = None) -> dict:
-        messages = body.get("messages")
-        if not messages:
-            return body
-
-        cleaned = []
-        for m in messages:
-            content = m.get("content")
-
-            if isinstance(content, str):
-                if MARK_START in content:
-                    new_text = _strip_markers(content)
-                    if not new_text:
-                        continue  # whole message was our injected system block: drop it
-                    m["content"] = new_text
-
-            elif isinstance(content, list):
-                new_blocks = []
-                for block in content:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "text"
-                        and MARK_START in block.get("text", "")
-                    ):
-                        stripped = _strip_markers(block["text"])
-                        if stripped:
-                            block["text"] = stripped
-                            new_blocks.append(block)
-                    else:
-                        new_blocks.append(block)
-                m["content"] = new_blocks
-
-            cleaned.append(m)
-
-        body["messages"] = cleaned
         return body

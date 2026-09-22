@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.7.3
+version: 0.7.4
 required_open_webui_version: 0.5.0
 """
 
@@ -39,12 +39,12 @@ class Filter:
             default="http://127.0.0.1:5001/v1",
             description="llama-server chat completions endpoint (e.g. http://127.0.0.1:5001/v1)",
         )
-        llama_model: str = Field(
-            default="",
+        LLAMA_MODEL: Optional[str] = Field(
+            default=None,
             description="model to use in router mode, leave empty for the currently loaded model",
         )
-        api_key: str = Field(
-            default="",
+        API_KEY: Optional[str] = Field(
+            default=None,
             description="API key for llama-server (--api-key value)",
         )
         id_slot: int = Field(
@@ -121,6 +121,25 @@ class Filter:
         )
         self.icon = SVG
 
+    # ---------- user valves ----------
+
+    def user_valves(self, __user__: dict) -> dict:
+        uv = __user__.get("valves") if isinstance(__user__, dict) else None
+        
+        if uv is not None:
+            if hasattr(uv, "model_dump"):
+                uv_dict = uv.model_dump()
+            elif hasattr(uv, "dict"):
+                uv_dict = uv.dict()
+            elif isinstance(uv, dict):
+                uv_dict = uv
+            else:
+                uv_dict = {}
+
+            return uv_dict
+        
+        return {}
+
     # ---------- cache ----------
 
     @staticmethod
@@ -141,6 +160,13 @@ class Filter:
             self._cache.popitem(last=False)
 
     # ---------- vision pass ----------
+
+    def _clean_model_id(self, model_id: Optional[str]) -> Optional[str]:
+        """Clean up the model ID to avoid sending empty strings or whitespace."""
+        if model_id is None:
+            return None
+        cleaned = model_id.strip().strip('"').strip("'")
+        return cleaned if cleaned else None
 
     def _extract_images(self, content) -> list:
         """Return list of image_url dicts from an Open WebUI message content."""
@@ -192,20 +218,21 @@ class Filter:
         if self.valves.id_slot >= 0:
             payload["id_slot"] = self.valves.id_slot
 
-        if self.valves.llama_model.strip():
-            payload["model"] = self.valves.llama_model
-        elif model:
+        if model is not None:
             payload["model"] = model
 
         try:
             url = self.valves.llama_url.rstrip("/") + "/chat/completions"
+            headers = {"Content-Type": "application/json"}
+
+            if self.valves.API_KEY:
+                headers["Authorization"] = f"Bearer {self.valves.API_KEY}"
+
             async with session.post(
                 url,
                 json=payload,
-                headers={
-                    "Authorization": f"Bearer {self.valves.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
+                timeout=self.valves.timeout,
             ) as r:
                 raw = await r.text()
                 if r.status != 200:
@@ -288,25 +315,11 @@ class Filter:
         __user__: Optional[dict] = None,
         __model__: Optional[dict] = None,
     ) -> dict:
-        uv = __user__.get("valves") if isinstance(__user__, dict) else None
-        
-        if uv is not None:
-            if hasattr(uv, "model_dump"):
-                uv_dict = uv.model_dump()
-            elif hasattr(uv, "dict"):
-                uv_dict = uv.dict()
-            elif isinstance(uv, dict):
-                uv_dict = uv
-            else:
-                uv_dict = {}
+        user_valves = self.user_valves(__user__)
 
-            regenerate = uv_dict.get("REGENERATE", self.valves.REGENERATE)
-            enabled = uv_dict.get("ENABLED", self.valves.ENABLED)
-            focus_prompt = uv_dict.get("FOCUS_PROMPT", "")
-        else:
-            regenerate = self.valves.REGENERATE
-            enabled = self.valves.ENABLED
-            focus_prompt = ""
+        enabled = user_valves.get("ENABLED", self.valves.ENABLED)
+        regenerate = user_valves.get("REGENERATE", self.valves.REGENERATE)
+        focus_prompt = user_valves.get("FOCUS_PROMPT", "")
 
         if not enabled:
             return body
@@ -335,10 +348,11 @@ class Filter:
             ):
                 return body
 
-        if __model__ and "info" in __model__:
-            model = __model__["info"].get("base_model_id") or None
-        else:
-            model = None
+        model_name = (
+            self._clean_model_id(self.valves.LLAMA_MODEL)
+            or self._clean_model_id(body.get("model"))
+            or None
+        )
 
         self._last_error = None
 
@@ -359,7 +373,7 @@ class Filter:
                         f"Running context-free vision pass on {misses} image(s)…",
                     )
                 raw = await asyncio.gather(
-                    *(self._describe(session, img, model=model, regenerate=regenerate, focus_prompt=focus_prompt) for img in images),
+                    *(self._describe(session, img, model=model_name, regenerate=regenerate, focus_prompt=focus_prompt) for img in images),
                     return_exceptions=True,
                 )
                 for i, r in enumerate(raw, 1):
@@ -376,7 +390,7 @@ class Filter:
                         )
                     raw.append(
                         await self._describe(
-                            session, img, model=model, regenerate=regenerate, focus_prompt=focus_prompt
+                            session, img, model=model_name, regenerate=regenerate, focus_prompt=focus_prompt
                         )
                     )
 
