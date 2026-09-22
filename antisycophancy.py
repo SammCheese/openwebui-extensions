@@ -2,7 +2,7 @@
 title: Anti-Sycophancy Anchor
 author: Sammy
 description: Counters positivity/confirmation bias in small instruct models (Gemma etc.) whose system prompt attention decays with context. Re-injects a condensed rule block at the END of context every turn.
-version: 0.3.1
+version: 0.3.2
 required_open_webui_version: 0.5.0
 """
 
@@ -48,8 +48,8 @@ class Filter:
             default="http://localhost:8080/v1",
             description="Base URL of the router service used to summarize the system prompt. Leave blank to disable system prompt summarization.",
         )
-        ROUTER_API_KEY: str = Field(
-            default="",
+        ROUTER_API_KEY: Optional[str] = Field(
+            default=None,
             description="Optional API key for the router service.",
         )
         ROUTER_MODEL: Optional[str] = Field(
@@ -130,7 +130,7 @@ class Filter:
                 "messages": [
                     {
                         "role": "system",
-                        "content": "Summarize the conduct and behavioral rules of this prompt into plain prose under 80 words. Avoid bullet points.",
+                        "content": "Summarize the conduct and behavioral rules of this prompt into plain prose under 100 words. Avoid bullet points.",
                     },
                     {"role": "user", "content": system_message},
                 ],
@@ -187,7 +187,7 @@ class Filter:
         reminder = self.valves.reminder_text
 
         # Derive reminder dynamically if requested
-        if self.valves.DERIVE_FROM_SYSTEM_PROMPT and self.valves.ROUTER_BASE_URL.strip():
+        if self.valves.DERIVE_FROM_SYSTEM_PROMPT:
             model_info = __model__.get("info", {}) if isinstance(__model__, dict) else {}
             model_name = (
                 self._clean_model_id(self.valves.ROUTER_MODEL)
@@ -216,12 +216,12 @@ class Filter:
                         await self._status(__event_emitter__, "Deriving new conduct reminder...")
                         derived = await self._summarize_system_prompt(combined_system, model=model_name)
                         if derived:
-                            await self._status(__event_emitter__, f"Derived conduct reminder: {derived[:60]}...", done=True)
+                            await self._status(__event_emitter__, f"Derived conduct reminder: {derived[:100]}...", done=True)
                             self._cache_put(sys_digest, derived)
                             reminder = derived
                     except Exception as e:
-                        print(f"[anti-syco] Failed to derive reminder: {e}")
                         await self._status(__event_emitter__, f"Failed to derive conduct reminder: {e}", done=True)
+                        print(f"[anti-syco] Failed to derive reminder: {e}")
 
 
         anchor = f"{_ANCHOR_START}\n{reminder}\n{_ANCHOR_END}"
