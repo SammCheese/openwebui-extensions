@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.7.5
+version: 0.7.6
 required_open_webui_version: 0.5.0
 """
 
@@ -353,6 +353,13 @@ class Filter:
 
         content = last.get("content")
         images = self._extract_images(content)
+
+
+        if not self.valves.keep_image:
+            # Strip all images from the conversation so the base model can't see them.
+            messages = self._strip_images(messages)
+            body["messages"] = messages
+
         if not images:
             return body
 
@@ -448,10 +455,5 @@ class Filter:
             new_content.append(part)
         new_content.append({"type": "text", "text": injected})
         last["content"] = new_content
-
-        if not self.valves.keep_image:
-            # Strip all images from the conversation so the base model can't see them.
-            messages = self._strip_images(messages)
-            body["messages"] = messages
 
         return body
