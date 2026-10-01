@@ -2,7 +2,7 @@
 title: Context-Free Vision Pre-Pass
 author: Sammy
 description: Sends images to llama-server in an isolated context for unbiased enumeration, then injects the result as text so the main conversation can't overwrite what the model saw.
-version: 0.7.4
+version: 0.7.5
 required_open_webui_version: 0.5.0
 """
 
@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -288,6 +288,24 @@ class Filter:
         self._last_error = reason
         print(f"[vision-prepass] failed: {reason}")
 
+    def _strip_images(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove all image payloads from messages so the base model never sees them."""
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Keep only text blocks, drop image_url blocks
+                text_only = [p for p in content if p.get("type") != "image_url"]
+                # Flatten to plain string if just text remains
+                msg["content"] = (
+                    " ".join(p.get("text", "") for p in text_only).strip()
+                    if text_only
+                    else ""
+                )
+            # Drop Ollama-style images array entirely
+            if "images" in msg:
+                del msg["images"]
+        return messages
+
     # ---------- filter entrypoint ----------
 
     @staticmethod
@@ -430,5 +448,10 @@ class Filter:
             new_content.append(part)
         new_content.append({"type": "text", "text": injected})
         last["content"] = new_content
+
+        if not self.valves.keep_image:
+            # Strip all images from the conversation so the base model can't see them.
+            messages = self._strip_images(messages)
+            body["messages"] = messages
 
         return body
