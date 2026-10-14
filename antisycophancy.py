@@ -2,7 +2,7 @@
 title: Anti-Sycophancy Anchor
 author: Sammy
 description: Counters positivity/confirmation bias in small instruct models (Gemma etc.) whose system prompt attention decays with context. Re-injects a condensed rule block at the END of context every turn.
-version: 0.3.2
+version: 0.3.3
 required_open_webui_version: 0.5.0
 """
 
@@ -132,10 +132,13 @@ class Filter:
                         "role": "system",
                         "content": "Summarize the conduct and behavioral rules of this prompt into plain prose under 100 words. Avoid bullet points.",
                     },
-                    {"role": "user", "content": system_message},
+                    {"role": "user", "content": f"Summarize the following conduct and behavioral rules concisely in plain prose:\n\n{system_message}"},
                 ],
                 "max_tokens": 300,
-                "temperature": 0.2,
+                "temperature": 0.3,
+                "chat_template_kwargs": {
+                    "enable_thinking": False
+                }
             }
 
             timeout = aiohttp.ClientTimeout(total=30.0)
